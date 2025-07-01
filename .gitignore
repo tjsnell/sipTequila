@@ -1,0 +1,4 @@
+tequila_images/
+*.pyc
+__pycache__/
+.DS_Store
