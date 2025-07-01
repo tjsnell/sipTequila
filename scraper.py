@@ -39,86 +39,220 @@ class TequilaScraper:
             return None
     
     async def handle_age_verification(self, page):
+        """Handle age verification if present"""
         try:
+            # Wait a bit to see if age verification appears
             await page.wait_for_timeout(2000)
             
+            # Try common age verification button selectors
             age_selectors = [
-                'button[type="submit"]',
-                'button:text("Yes")',
-                'button:text("I am 21")',
-                'button:text("Enter")',
+                'button:has-text("Yes")',
+                'button:has-text("I am 21")',
+                'button:has-text("Enter")',
+                'button:has-text("I\'m 21")',
+                'button:has-text("I am over 21")',
+                'button:has-text("YES")',
+                'a:has-text("Yes")',
+                'a:has-text("Enter")',
                 '.age-gate__button',
-                '.age-verification button'
+                '.age-verification button',
+                '[data-age-gate-submit]',
+                'button[type="submit"]'
             ]
             
             for selector in age_selectors:
                 try:
                     button = await page.wait_for_selector(selector, timeout=1000)
                     if button:
-                        print(f"Found age verification button: {selector}")
+                        print(f"Found age verification button with selector: {selector}")
                         await button.click()
                         await page.wait_for_timeout(2000)
                         return True
                 except:
                     continue
-                    
+            
             return False
         except Exception as e:
             print(f"Error handling age verification: {e}")
             return False
             
-    async def scrape_page(self, page, url, handle_age_gate=False):
-        print(f"Loading: {url}")
+    async def scrape_page(self, page, url):
         await page.goto(url, wait_until='domcontentloaded')
         
-        if handle_age_gate:
+        # Handle age verification if it's the first page
+        if "?page=" not in url:
             await self.handle_age_verification(page)
         
+        # Wait for page to stabilize
         await page.wait_for_timeout(3000)
         
-        # Scroll to load lazy-loaded content
+        # Scroll to load lazy-loaded images
         await page.evaluate('''
             async () => {
-                const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-                for (let i = 0; i < 5; i++) {
-                    window.scrollTo(0, document.body.scrollHeight);
-                    await delay(1000);
-                }
+                await new Promise((resolve) => {
+                    let totalHeight = 0;
+                    const distance = 100;
+                    const timer = setInterval(() => {
+                        const scrollHeight = document.body.scrollHeight;
+                        window.scrollBy(0, distance);
+                        totalHeight += distance;
+                        
+                        if(totalHeight >= scrollHeight){
+                            clearInterval(timer);
+                            resolve();
+                        }
+                    }, 100);
+                });
             }
         ''')
         
-        # Extract products using the same approach as the original working scraper
+        # Wait after scrolling
+        await page.wait_for_timeout(2000)
+        
+        # Extract products
         products = await page.evaluate('''() => {
             const products = [];
-            const items = document.querySelectorAll('.grid__item');
+            
+            // Try different selectors
+            const selectors = [
+                '.product-item',
+                '.grid__item',
+                '.collection__product',
+                'article[data-product-id]',
+                '[data-product-handle]',
+                '.product-grid-item',
+                '.product-card'
+            ];
+            
+            let items = [];
+            for (const selector of selectors) {
+                const found = document.querySelectorAll(selector);
+                if (found.length > 0) {
+                    items = found;
+                    console.log(`Found ${found.length} items with selector: ${selector}`);
+                    break;
+                }
+            }
+            
+            // If no specific product items found, try to find any links with product info
+            if (items.length === 0) {
+                const links = document.querySelectorAll('a[href*="/products/"]');
+                const productLinks = new Map();
+                
+                links.forEach(link => {
+                    const href = link.getAttribute('href');
+                    if (href && href.includes('/products/') && !href.includes('/collections/')) {
+                        const parent = link.closest('.grid__item') || link.closest('[class*="product"]') || link.parentElement;
+                        if (parent && !productLinks.has(href)) {
+                            productLinks.set(href, parent);
+                        }
+                    }
+                });
+                
+                items = Array.from(productLinks.values());
+                console.log(`Found ${items.length} product links`);
+            }
             
             items.forEach(item => {
                 try {
-                    const link = item.querySelector('a.product-item__title');
-                    const priceElement = item.querySelector('.product-item__price-list .price');
-                    const imageElement = item.querySelector('.product-item__primary-image img');
+                    // Find product name
+                    const nameSelectors = [
+                        '.product-item__title',
+                        '.product__title',
+                        '.product-card__title',
+                        '.product-card__name',
+                        'h3 a',
+                        'h2 a',
+                        'h3',
+                        'h2',
+                        'a[href*="/products/"]'
+                    ];
                     
-                    let price = null;
-                    if (priceElement) {
-                        const priceText = priceElement.textContent.trim();
-                        const priceMatch = priceText.match(/\\$[\\d,]+\\.?\\d*/);
-                        price = priceMatch ? priceMatch[0] : priceText;
+                    let name = null;
+                    let productUrl = null;
+                    
+                    for (const selector of nameSelectors) {
+                        const elem = item.querySelector(selector);
+                        if (elem) {
+                            name = elem.textContent.trim();
+                            if (elem.tagName === 'A') {
+                                productUrl = elem.getAttribute('href');
+                            } else {
+                                const link = elem.querySelector('a') || item.querySelector('a[href*="/products/"]');
+                                if (link) productUrl = link.getAttribute('href');
+                            }
+                            if (name && name.length > 0) break;
+                        }
                     }
                     
+                    // Find price
+                    const priceSelectors = [
+                        '.price',
+                        '.product-item__price',
+                        '.product__price',
+                        '.product-card__price',
+                        '.money',
+                        '[data-price]',
+                        'span[class*="price"]'
+                    ];
+                    
+                    let price = null;
+                    for (const selector of priceSelectors) {
+                        const elem = item.querySelector(selector);
+                        if (elem) {
+                            const priceText = elem.textContent.trim();
+                            const priceMatch = priceText.match(/\\$[\\d,]+\\.?\\d*/);
+                            if (priceMatch) {
+                                price = priceMatch[0];
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // Find image
+                    const imgSelectors = [
+                        'img[data-src]',
+                        'img[src*="cdn.shopify"]',
+                        'img.product__image',
+                        'img.product-card__image',
+                        'img',
+                        '.responsive-image__image'
+                    ];
+                    
                     let imageUrl = null;
-                    if (imageElement) {
-                        imageUrl = imageElement.getAttribute('data-src') || imageElement.getAttribute('src');
+                    for (const selector of imgSelectors) {
+                        const img = item.querySelector(selector);
+                        if (img) {
+                            imageUrl = img.getAttribute('data-src') || 
+                                      img.getAttribute('src') ||
+                                      img.getAttribute('data-srcset');
+                            if (imageUrl) {
+                                // Clean up srcset if needed
+                                if (imageUrl.includes(' ')) {
+                                    imageUrl = imageUrl.split(' ')[0];
+                                }
+                                // Skip placeholder images
+                                if (!imageUrl.includes('placeholder') && !imageUrl.includes('no-image')) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (name && productUrl) {
+                        // Ensure full URLs
+                        if (productUrl && !productUrl.startsWith('http')) {
+                            productUrl = 'https://siptequila.com' + productUrl;
+                        }
                         if (imageUrl && imageUrl.startsWith('//')) {
                             imageUrl = 'https:' + imageUrl;
                         } else if (imageUrl && !imageUrl.startsWith('http')) {
                             imageUrl = 'https://siptequila.com' + imageUrl;
                         }
-                    }
-                    
-                    if (link) {
+                        
                         products.push({
-                            name: link.textContent.trim(),
-                            url: 'https://siptequila.com' + link.getAttribute('href'),
+                            name: name,
+                            url: productUrl,
                             price: price || 'Price not found',
                             image_url: imageUrl
                         });
@@ -133,6 +267,17 @@ class TequilaScraper:
         
         return products
         
+    async def check_next_page(self, page):
+        """Check if there's a next page"""
+        try:
+            next_link = await page.query_selector('a:has-text("Next")')
+            if next_link:
+                is_disabled = await next_link.evaluate('el => el.classList.contains("disabled") || el.hasAttribute("disabled")')
+                return not is_disabled
+            return False
+        except:
+            return False
+            
     async def scrape_all_pages(self):
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -144,6 +289,7 @@ class TequilaScraper:
                 viewport={'width': 1920, 'height': 1080}
             )
             
+            # Add stealth scripts
             await context.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => undefined
@@ -153,65 +299,72 @@ class TequilaScraper:
             page = await context.new_page()
             
             page_num = 1
-            consecutive_empty = 0
-            max_pages = 40
+            consecutive_empty_pages = 0
             
             async with aiohttp.ClientSession() as session:
-                while page_num <= max_pages and consecutive_empty < 3:
-                    url = f"{self.base_url}?page={page_num}"
+                while page_num <= 50 and consecutive_empty_pages < 3:  # Stop after 3 consecutive empty pages
+                    current_url = f"{self.base_url}?page={page_num}"
+                    print(f"\nScraping page {page_num}: {current_url}")
                     
                     try:
-                        products = await self.scrape_page(page, url, handle_age_gate=(page_num == 1))
+                        products = await self.scrape_page(page, current_url)
                         
                         if not products:
-                            consecutive_empty += 1
-                            print(f"Page {page_num}: No products found")
+                            consecutive_empty_pages += 1
+                            print(f"No products found on page {page_num}")
+                            if consecutive_empty_pages >= 3:
+                                print("No products found on 3 consecutive pages, stopping.")
+                                break
                         else:
-                            consecutive_empty = 0
+                            consecutive_empty_pages = 0
                             new_products = 0
                             
                             for product in products:
+                                # Check if we already have this product
                                 if product['url'] not in self.seen_products:
                                     self.seen_products.add(product['url'])
                                     
                                     if product['image_url']:
                                         image_filename = await self.download_image(
-                                            session,
-                                            product['image_url'],
+                                            session, 
+                                            product['image_url'], 
                                             product['name']
                                         )
                                         product['image_filename'] = image_filename
                                     else:
                                         product['image_filename'] = None
-                                    
+                                        
                                     self.products.append(product)
                                     new_products += 1
-                                    print(f"  + {product['name']} - {product['price']}")
+                                    print(f"Scraped: {product['name']} - {product['price']}")
                             
-                            print(f"Page {page_num}: Found {len(products)} products ({new_products} new)")
+                            print(f"Found {len(products)} products on page {page_num} ({new_products} new)")
                             print(f"Total unique products: {len(self.products)}")
                         
+                        # Check if there's a next page
+                        has_next = await self.check_next_page(page)
+                        if not has_next and products:
+                            print("No next page found, stopping.")
+                            break
+                            
                         page_num += 1
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(2)  # Be respectful
                         
                     except Exception as e:
-                        print(f"Error on page {page_num}: {e}")
-                        consecutive_empty += 1
+                        print(f"Error scraping page {current_url}: {e}")
+                        consecutive_empty_pages += 1
+                        if consecutive_empty_pages >= 3:
+                            break
                         page_num += 1
                         
             await context.close()
             await browser.close()
             
     def save_to_json(self):
-        # Always save to the same file
         with open('tequila_products.json', 'w', encoding='utf-8') as f:
             json.dump(self.products, f, indent=2, ensure_ascii=False)
+        print(f"\nSaved {len(self.products)} unique products to tequila_products.json")
         
-        print(f"\n=== COMPLETE ===")
-        print(f"Saved {len(self.products)} unique products to tequila_products.json")
-        print(f"Timestamp: {datetime.now().isoformat()}")
-        
-        # Return stats for git commit message
         return {
             'total_products': len(self.products),
             'timestamp': datetime.now().isoformat()
@@ -225,4 +378,7 @@ async def main():
     
 if __name__ == "__main__":
     stats = asyncio.run(main())
-    print(f"\nRun 'git add tequila_products.json && git commit -m \"Update: {stats['total_products']} products - {stats['timestamp']}\"' to save this version")
+    print(f"\nSuggested git commands:")
+    print(f"git add scraper.py tequila_products.json")
+    print(f"git commit -m \"Update: {stats['total_products']} products scraped on {stats['timestamp'][:10]}\"")
+    print(f"git tag -a v{datetime.now().strftime('%Y%m%d_%H%M%S')} -m \"Scrape run: {stats['total_products']} products\"")
