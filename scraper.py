@@ -76,11 +76,12 @@ class TequilaScraper:
             print(f"Error handling age verification: {e}")
             return False
             
-    async def scrape_page(self, page, url):
+    async def scrape_page(self, page, url, page_num):
+        print(f"Loading page {page_num}: {url}")
         await page.goto(url, wait_until='domcontentloaded')
         
-        # Handle age verification if it's the first page
-        if "?page=" not in url:
+        # Handle age verification only on first page
+        if page_num == 1:
             await self.handle_age_verification(page)
         
         # Wait for page to stabilize
@@ -109,7 +110,7 @@ class TequilaScraper:
         # Wait after scrolling
         await page.wait_for_timeout(2000)
         
-        # Extract products
+        # Extract products with better price extraction
         products = await page.evaluate('''() => {
             const products = [];
             
@@ -185,15 +186,18 @@ class TequilaScraper:
                         }
                     }
                     
-                    // Find price
+                    // Find price - expanded selectors
                     const priceSelectors = [
-                        '.price',
-                        '.product-item__price',
+                        '.price:not(.price--compare)',
+                        '.product-item__price-list .price',
+                        '.product-item__price .price',
                         '.product__price',
                         '.product-card__price',
                         '.money',
                         '[data-price]',
-                        'span[class*="price"]'
+                        'span[class*="price"]:not([class*="compare"])',
+                        '.price-item--regular',
+                        '.price__current'
                     ];
                     
                     let price = null;
@@ -201,10 +205,26 @@ class TequilaScraper:
                         const elem = item.querySelector(selector);
                         if (elem) {
                             const priceText = elem.textContent.trim();
+                            // Look for price patterns
                             const priceMatch = priceText.match(/\\$[\\d,]+\\.?\\d*/);
                             if (priceMatch) {
                                 price = priceMatch[0];
                                 break;
+                            }
+                        }
+                    }
+                    
+                    // If no price found, check data attributes
+                    if (!price) {
+                        const priceElem = item.querySelector('[data-price]');
+                        if (priceElem) {
+                            const dataPrice = priceElem.getAttribute('data-price');
+                            if (dataPrice) {
+                                // Convert cents to dollars if needed
+                                const priceNum = parseFloat(dataPrice);
+                                if (priceNum > 0) {
+                                    price = priceNum > 1000 ? `$${(priceNum / 100).toFixed(2)}` : `$${priceNum.toFixed(2)}`;
+                                }
                             }
                         }
                     }
@@ -267,17 +287,6 @@ class TequilaScraper:
         
         return products
         
-    async def check_next_page(self, page):
-        """Check if there's a next page"""
-        try:
-            next_link = await page.query_selector('a:has-text("Next")')
-            if next_link:
-                is_disabled = await next_link.evaluate('el => el.classList.contains("disabled") || el.hasAttribute("disabled")')
-                return not is_disabled
-            return False
-        except:
-            return False
-            
     async def scrape_all_pages(self):
         async with async_playwright() as p:
             browser = await p.chromium.launch(
@@ -300,21 +309,20 @@ class TequilaScraper:
             
             page_num = 1
             consecutive_empty_pages = 0
+            max_empty_pages = 3
+            max_total_pages = 50  # Increase limit since we expect 250+ products
             
             async with aiohttp.ClientSession() as session:
-                while page_num <= 50 and consecutive_empty_pages < 3:  # Stop after 3 consecutive empty pages
+                while page_num <= max_total_pages and consecutive_empty_pages < max_empty_pages:
+                    # Use explicit page parameter
                     current_url = f"{self.base_url}?page={page_num}"
-                    print(f"\nScraping page {page_num}: {current_url}")
                     
                     try:
-                        products = await self.scrape_page(page, current_url)
+                        products = await self.scrape_page(page, current_url, page_num)
                         
                         if not products:
                             consecutive_empty_pages += 1
                             print(f"No products found on page {page_num}")
-                            if consecutive_empty_pages >= 3:
-                                print("No products found on 3 consecutive pages, stopping.")
-                                break
                         else:
                             consecutive_empty_pages = 0
                             new_products = 0
@@ -336,25 +344,20 @@ class TequilaScraper:
                                         
                                     self.products.append(product)
                                     new_products += 1
-                                    print(f"Scraped: {product['name']} - {product['price']}")
+                                    print(f"  + {product['name']} - {product['price']}")
                             
                             print(f"Found {len(products)} products on page {page_num} ({new_products} new)")
                             print(f"Total unique products: {len(self.products)}")
                         
-                        # Check if there's a next page
-                        has_next = await self.check_next_page(page)
-                        if not has_next and products:
-                            print("No next page found, stopping.")
-                            break
-                            
+                        # Always try next page unless we've had too many empty pages
                         page_num += 1
-                        await asyncio.sleep(2)  # Be respectful
+                        
+                        # Be respectful with rate limiting
+                        await asyncio.sleep(2)
                         
                     except Exception as e:
                         print(f"Error scraping page {current_url}: {e}")
                         consecutive_empty_pages += 1
-                        if consecutive_empty_pages >= 3:
-                            break
                         page_num += 1
                         
             await context.close()
@@ -365,8 +368,13 @@ class TequilaScraper:
             json.dump(self.products, f, indent=2, ensure_ascii=False)
         print(f"\nSaved {len(self.products)} unique products to tequila_products.json")
         
+        # Print price statistics
+        prices_found = sum(1 for p in self.products if p['price'] != 'Price not found')
+        print(f"Prices found: {prices_found}/{len(self.products)} ({prices_found/len(self.products)*100:.1f}%)")
+        
         return {
             'total_products': len(self.products),
+            'prices_found': prices_found,
             'timestamp': datetime.now().isoformat()
         }
         
@@ -380,5 +388,5 @@ if __name__ == "__main__":
     stats = asyncio.run(main())
     print(f"\nSuggested git commands:")
     print(f"git add scraper.py tequila_products.json")
-    print(f"git commit -m \"Update: {stats['total_products']} products scraped on {stats['timestamp'][:10]}\"")
+    print(f"git commit -m \"Update: {stats['total_products']} products ({stats['prices_found']} with prices) - {stats['timestamp'][:10]}\"")
     print(f"git tag -a v{datetime.now().strftime('%Y%m%d_%H%M%S')} -m \"Scrape run: {stats['total_products']} products\"")
